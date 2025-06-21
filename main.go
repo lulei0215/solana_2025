@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/go-redis/redis/v8"
 )
 
 const (
@@ -20,6 +22,8 @@ const (
 	maxRetries = 3
 	// 重试间隔（秒）
 	retryInterval = 5
+	// 配置文件路径
+	configFile = "addresses.json"
 )
 
 // 交易类型配置
@@ -32,10 +36,28 @@ type TxTypeConfig struct {
 	ShowOtherTransfer   bool
 }
 
+// 监控地址配置结构
+type AddressConfig struct {
+	MonitorAddresses []string `json:"monitor_addresses"`
+	Description      string   `json:"description"`
+	CreatedAt        string   `json:"created_at"`
+}
+
 // 监控地址配置
 type MonitorConfig struct {
 	Addresses map[string]bool // 要监控的地址列表
 	TxConfig  TxTypeConfig    // 交易类型配置
+}
+
+// 监控转账信息结构
+type MonitorTransfer struct {
+	MonitorAddress string  `json:"monitor_address"`
+	FromAddress    string  `json:"from_address"`
+	Amount         float64 `json:"amount"`
+	TxHash         string  `json:"tx_hash"`
+	TxTime         string  `json:"tx_time"`
+	Status         string  `json:"status"`
+	Fee            float64 `json:"fee"`
 }
 
 // 默认配置：只显示SOL转账
@@ -48,6 +70,62 @@ func getDefaultConfig() TxTypeConfig {
 		ShowComputeTransfer: false,
 		ShowOtherTransfer:   false,
 	}
+}
+
+// 从JSON文件读取监控地址
+func loadAddressesFromFile(filename string) (map[string]bool, error) {
+	addresses := make(map[string]bool)
+
+	// 检查文件是否存在
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		return addresses, fmt.Errorf("配置文件 %s 不存在", filename)
+	}
+
+	// 读取文件内容
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return addresses, fmt.Errorf("读取配置文件失败: %v", err)
+	}
+
+	// 解析JSON
+	var config AddressConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return addresses, fmt.Errorf("解析JSON配置失败: %v", err)
+	}
+
+	// 转换地址列表为map
+	for _, addr := range config.MonitorAddresses {
+		addr = strings.TrimSpace(addr)
+		if addr != "" {
+			addresses[addr] = true
+		}
+	}
+
+	return addresses, nil
+}
+
+// 创建默认配置文件
+func createDefaultConfigFile(filename string) error {
+	defaultConfig := AddressConfig{
+		MonitorAddresses: []string{
+			"11111111111111111111111111111111", // 示例地址1
+			"22222222222222222222222222222222", // 示例地址2
+			"33333333333333333333333333333333", // 示例地址3
+		},
+		Description: "监控地址列表 - 请修改为您要监控的地址",
+		CreatedAt:   time.Now().Format("2006-01-02T15:04:05Z"),
+	}
+
+	data, err := json.MarshalIndent(defaultConfig, "", "  ")
+	if err != nil {
+		return fmt.Errorf("生成默认配置失败: %v", err)
+	}
+
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return fmt.Errorf("写入配置文件失败: %v", err)
+	}
+
+	return nil
 }
 
 // 获取监控配置
@@ -71,32 +149,27 @@ func getMonitorConfig() MonitorConfig {
 		txConfig.ShowOtherTransfer = true
 	}
 
-	// 初始化监控地址map
-	addresses := make(map[string]bool)
+	// 从JSON文件读取监控地址
+	addresses, err := loadAddressesFromFile(configFile)
+	if err != nil {
+		fmt.Printf("****** 警告: %v ******\n", err)
+		fmt.Printf("****** 尝试创建默认配置文件 %s ******\n", configFile)
 
-	// 从环境变量读取监控地址（用逗号分隔）
-	monitorAddrs := os.Getenv("MONITOR_ADDRESSES")
-	if monitorAddrs != "" {
-		addrList := strings.Split(monitorAddrs, ",")
-		for _, addr := range addrList {
-			addr = strings.TrimSpace(addr)
-			if addr != "" {
-				addresses[addr] = true
-			}
+		if createErr := createDefaultConfigFile(configFile); createErr != nil {
+			fmt.Printf("****** 创建默认配置文件失败: %v ******\n", createErr)
+			fmt.Printf("****** 请手动创建 %s 文件并添加监控地址 ******\n", configFile)
+			os.Exit(1)
 		}
+
+		fmt.Printf("****** 已创建默认配置文件 %s，请编辑后重新运行程序 ******\n", configFile)
+		os.Exit(1)
 	}
 
-	// 如果没有从环境变量读取到地址，使用默认地址列表
+	// 检查是否有监控地址
 	if len(addresses) == 0 {
-		defaultAddresses := []string{
-			"5xSth6eYNeykmFXzCFL42dmD8jngqJUyBRaZbjz7Db5F", // 示例地址1
-			"CTe3cr6nh4NJXESkCPvxodVGpgb52T2E24bdnvgzwRCX", // 示例地址2
-			"Gu1jCbrMok1oEXwNEMNDoJrx136jhe15VGbzdAijazfJ", // 示例地址2
-			// 可以在这里添加更多默认地址
-		}
-		for _, addr := range defaultAddresses {
-			addresses[addr] = true
-		}
+		fmt.Printf("****** 错误: 配置文件 %s 中没有找到有效的监控地址 ******\n", configFile)
+		fmt.Printf("****** 请检查配置文件格式是否正确 ******\n")
+		os.Exit(1)
 	}
 
 	return MonitorConfig{
@@ -193,41 +266,36 @@ func isMonitoredAddress(addr string, monitorAddrs map[string]bool) bool {
 	return monitorAddrs[addr]
 }
 
-func processTransaction(txIndex int, tx rpc.TransactionWithMeta, config MonitorConfig) {
+func processTransaction(txIndex int, tx rpc.TransactionWithMeta, config MonitorConfig, blockTime int64) {
 	decoded, err := tx.GetTransaction()
 	if err != nil {
 		return
 	}
 
-	// 确定交易类型
 	txType := getTxType(tx.Meta.LogMessages)
-
-	// 检查是否应该显示该交易类型
 	if !shouldShowTransaction(txType, config.TxConfig) {
 		return
 	}
 
-	// 获取交易签名（哈希）
-	txHash := "未知"
+	txHash := ""
 	if len(decoded.Signatures) > 0 {
 		txHash = decoded.Signatures[0].String()
 	}
 
-	fmt.Printf("--- 交易 #%d ---\n", txIndex)
-	fmt.Printf("交易哈希: %s\n", txHash)
-	fmt.Printf("交易类型: %s\n", txType)
-
-	// 显示交易状态和手续费
-	if tx.Meta.Err == nil {
-		fmt.Println("状态: 成功")
+	var txTime string
+	if blockTime > 0 {
+		txTime = time.Unix(blockTime, 0).Format("2006-01-02 15:04:05")
 	} else {
-		fmt.Printf("状态: 失败 (%s)\n", tx.Meta.Err)
+		txTime = "未知"
 	}
-	fmt.Printf("手续费: %d lamports (%.9f SOL)\n", tx.Meta.Fee, float64(tx.Meta.Fee)/1e9)
-	fmt.Println()
 
-	// 显示账户余额变化
-	fmt.Println("账户余额信息:")
+	status := "成功"
+	if tx.Meta.Err != nil {
+		status = "失败"
+	}
+
+	fee := float64(tx.Meta.Fee) / 1e9
+
 	balanceChanges := make(map[string]int64)
 	for i, key := range decoded.Message.AccountKeys {
 		if i < len(tx.Meta.PreBalances) && i < len(tx.Meta.PostBalances) {
@@ -236,44 +304,49 @@ func processTransaction(txIndex int, tx rpc.TransactionWithMeta, config MonitorC
 			if preBalance != postBalance {
 				change := int64(postBalance) - int64(preBalance)
 				balanceChanges[key.String()] = change
-				fmt.Printf("账户: %s\n", key.String())
-				fmt.Printf("  余额变化: %.9f SOL\n", float64(change)/1e9)
-				fmt.Println()
 			}
 		}
 	}
 
-	// 显示程序调用日志
-	fmt.Println("程序调用日志:")
-	for _, log := range tx.Meta.LogMessages {
-		fmt.Printf("  %s\n", log)
-	}
-
-	// 显示转出方和转入方
-	fmt.Println("\n转出方:")
+	var fromAddr string
 	for addr, change := range balanceChanges {
-		if change < 0 {
-			fmt.Printf("  %s (转出 %.9f SOL)\n", addr, float64(-change)/1e9)
+		if change < 0 && !isSystemAccount(addr) && !isMonitoredAddress(addr, config.Addresses) {
+			fromAddr = addr
+			break
 		}
 	}
 
-	fmt.Println("\n转入方:")
 	if txType == "SOL转账" {
 		for addr, change := range balanceChanges {
-			if change > 0 && !isSystemAccount(addr) {
-				fmt.Printf("  %s (收到 %.9f SOL)\n", addr, float64(change)/1e9)
+			if change > 0 && !isSystemAccount(addr) && isMonitoredAddress(addr, config.Addresses) {
+				transfer := MonitorTransfer{
+					MonitorAddress: addr,
+					FromAddress:    fromAddr,
+					Amount:         float64(change) / 1e9,
+					TxHash:         txHash,
+					TxTime:         txTime,
+					Status:         status,
+					Fee:            fee,
+				}
 
-				// 检查是否是监控的地址
-				if isMonitoredAddress(addr, config.Addresses) {
-					fmt.Printf("****** OK! 监控地址 %s 收到 %.9f SOL ******\n", addr, float64(change)/1e9)
+				// 打印详细信息
+				fmt.Printf("****** 监控地址: %s ******\n", transfer.MonitorAddress)
+				fmt.Printf("****** 转出地址: %s ******\n", transfer.FromAddress)
+				fmt.Printf("****** 收到金额: %.9f SOL ******\n", transfer.Amount)
+				fmt.Printf("****** 交易哈希: %s ******\n", transfer.TxHash)
+				fmt.Printf("****** 交易时间: %s ******\n", transfer.TxTime)
+				fmt.Printf("****** 交易状态: %s ******\n", transfer.Status)
+				fmt.Printf("****** 手续费: %.9f SOL ******\n", transfer.Fee)
+				fmt.Println("****** ================== ******")
+
+				// 保存到redis
+				ctx := context.Background()
+				if err := saveToRedis(ctx, "solana:monitor:transfers", transfer); err != nil {
+					fmt.Printf("****** 保存到redis失败: %v ******\n", err)
 				}
 			}
 		}
-	} else {
-		fmt.Printf("  [%s]\n", txType)
 	}
-
-	fmt.Println("------------------------\n")
 }
 
 func getBlockDetails(client *rpc.Client, slot uint64) (*rpc.GetBlockResult, error) {
@@ -297,6 +370,8 @@ func getBlockDetails(client *rpc.Client, slot uint64) (*rpc.GetBlockResult, erro
 	return block, nil
 }
 
+// 注释掉区块信息打印
+/*
 func printBlockInfo(block *rpc.GetBlockResult, blockNum uint64) {
 	fmt.Printf("****** 区块 %d 详细信息 ******\n", blockNum)
 	if block.BlockTime != nil {
@@ -307,6 +382,7 @@ func printBlockInfo(block *rpc.GetBlockResult, blockNum uint64) {
 	fmt.Printf("****** 交易数量: %d ******\n", len(block.Transactions))
 	fmt.Println("****** ================== ******\n")
 }
+*/
 
 // 处理单个区块
 func processBlock(client *rpc.Client, blockNum uint64, config MonitorConfig) error {
@@ -321,7 +397,8 @@ func processBlock(client *rpc.Client, blockNum uint64, config MonitorConfig) err
 		}
 
 		if retry < maxRetries-1 {
-			fmt.Printf("****** 获取区块 %d 失败，%d 秒后重试... (错误: %v) ******\n", blockNum, retryInterval, err)
+			// 注释掉重试信息
+			// fmt.Printf("****** 获取区块 %d 失败，%d 秒后重试... (错误: %v) ******\n", blockNum, retryInterval, err)
 			time.Sleep(time.Duration(retryInterval) * time.Second)
 		}
 	}
@@ -330,23 +407,33 @@ func processBlock(client *rpc.Client, blockNum uint64, config MonitorConfig) err
 		return fmt.Errorf("获取区块 %d 失败，已重试 %d 次: %v", blockNum, maxRetries, err)
 	}
 
-	printBlockInfo(block, blockNum)
+	// 注释掉区块信息打印
+	// printBlockInfo(block, blockNum)
 
 	// 处理区块中的交易
 	validTxCount := 0
+	var blockTime int64
+	if block.BlockTime != nil {
+		blockTime = int64(*block.BlockTime)
+	} else {
+		blockTime = 0
+	}
 	for i, tx := range block.Transactions {
 		// 保存当前交易数量
 		prevCount := validTxCount
-		processTransaction(i+1, tx, config)
+		processTransaction(i+1, tx, config, blockTime)
 		// 如果交易被处理了（没有被过滤），增加计数
 		if validTxCount == prevCount {
 			validTxCount++
 		}
 	}
 
-	if validTxCount == 0 {
-		fmt.Printf("****** 区块 %d 中没有符合条件的交易 ******\n", blockNum)
-	}
+	// 注释掉无交易提示
+	/*
+		if validTxCount == 0 {
+			fmt.Printf("****** 区块 %d 中没有符合条件的交易 ******\n", blockNum)
+		}
+	*/
 
 	return nil
 }
@@ -355,8 +442,10 @@ func processBlock(client *rpc.Client, blockNum uint64, config MonitorConfig) err
 func monitorBlocks(client *rpc.Client, startBlock uint64, config MonitorConfig) {
 	currentBlock := startBlock
 
+	// 只保留启动信息
 	fmt.Printf("****** 开始监听区块，起始区块: %d ******\n", startBlock)
 	fmt.Printf("****** 监听间隔: %d 秒 ******\n", monitorInterval)
+	fmt.Printf("****** 配置文件: %s ******\n", configFile)
 	fmt.Printf("****** 监控地址数量: %d ******\n", len(config.Addresses))
 	fmt.Println("****** 监控地址列表: ******")
 	for addr := range config.Addresses {
@@ -368,23 +457,30 @@ func monitorBlocks(client *rpc.Client, startBlock uint64, config MonitorConfig) 
 		// 获取最新区块号
 		latestSlot, err := getLatestSlot(client)
 		if err != nil {
-			fmt.Printf("****** 获取最新区块号失败: %v ******\n", err)
+			// 注释掉错误信息
+			// fmt.Printf("****** 获取最新区块号失败: %v ******\n", err)
 			time.Sleep(time.Duration(monitorInterval) * time.Second)
 			continue
 		}
 
 		// 检查当前区块是否超过最新区块
 		if currentBlock > latestSlot {
-			fmt.Printf("****** 当前区块 %d 超过最新区块 %d，等待新区块... ******\n", currentBlock, latestSlot)
+			// 注释掉等待信息
+			// fmt.Printf("****** 当前区块 %d 超过最新区块 %d，等待新区块... ******\n", currentBlock, latestSlot)
 			time.Sleep(time.Duration(monitorInterval) * time.Second)
 			continue
 		}
 
+		// 打印当前区块高度
+		fmt.Printf("****** 当前区块高度: %d (最新区块: %d) ******\n", currentBlock, latestSlot)
+
 		// 处理当前区块
-		fmt.Printf("\n****** 正在处理区块 %d (最新区块: %d) ******\n", currentBlock, latestSlot)
+		// 注释掉处理信息
+		// fmt.Printf("\n****** 正在处理区块 %d (最新区块: %d) ******\n", currentBlock, latestSlot)
 		err = processBlock(client, currentBlock, config)
 		if err != nil {
-			fmt.Printf("****** 处理区块 %d 失败: %v ******\n", currentBlock, err)
+			// 注释掉错误信息
+			// fmt.Printf("****** 处理区块 %d 失败: %v ******\n", currentBlock, err)
 			// 如果处理失败，等待一段时间后继续下一个区块
 			time.Sleep(time.Duration(monitorInterval) * time.Second)
 		}
@@ -397,6 +493,34 @@ func monitorBlocks(client *rpc.Client, startBlock uint64, config MonitorConfig) 
 	}
 }
 
+var redisClient *redis.Client
+
+func initRedis() {
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "", // 替换为你的Redis密码
+		DB:       3,  // 替换为你的Redis DB
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		fmt.Printf("****** Redis连接失败: %v ******\n", err)
+		os.Exit(1)
+	} else {
+		fmt.Println("****** Redis连接成功 ******")
+	}
+}
+
+func saveToRedis(ctx context.Context, key string, data MonitorTransfer) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return redisClient.LPush(ctx, key, b).Err()
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Println("****** Usage: go run main.go <start_block_number> ******")
@@ -406,9 +530,8 @@ func main() {
 		fmt.Println("******   SHOW_STAKE_TRANSFER=true    # 显示质押交易 ******")
 		fmt.Println("******   SHOW_COMPUTE_TRANSFER=true  # 显示计算预算交易 ******")
 		fmt.Println("******   SHOW_OTHER_TRANSFER=true    # 显示其他交易 ******")
-		fmt.Println("******   MONITOR_ADDRESSES=addr1,addr2,addr3  # 监控地址列表（逗号分隔） ******")
-		fmt.Println("\n****** 默认只显示SOL转账 ******")
-		fmt.Println("\n****** 程序会从指定区块开始，自动循环监听后续区块 ******")
+		fmt.Println("\n****** 配置文件: addresses.json ******")
+		fmt.Println("****** 程序会从指定区块开始，自动循环监听后续区块 ******")
 		os.Exit(1)
 	}
 
@@ -434,6 +557,8 @@ func main() {
 		fmt.Printf("****** 起始区块 %d 超过最新区块 %d，请使用有效的区块号 ******\n", startBlock, latestSlot)
 		os.Exit(1)
 	}
+
+	initRedis()
 
 	// 开始循环监听
 	monitorBlocks(client, startBlock, config)
