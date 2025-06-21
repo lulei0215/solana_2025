@@ -665,7 +665,7 @@ func monitorBlockRange(client *rpc.Client, startBlock, endBlock uint64, config M
 	for currentBlock := startBlock; currentBlock <= endBlock; currentBlock++ {
 		fmt.Printf("****** 处理区块: %d / %d ******\n", currentBlock, endBlock)
 
-		err := processBlock(client, currentBlock, config)
+		err := processBlockParallel(client, currentBlock, config)
 		if err != nil {
 			fmt.Printf("****** 处理区块 %d 失败: %v ******\n", currentBlock, err)
 		}
