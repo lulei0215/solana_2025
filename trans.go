@@ -17,10 +17,12 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/programs/system"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -211,6 +213,11 @@ func (wm *WalletManager) decryptPrivateKeyWithTOTP(totpCode string) (*solana.Pri
 		return nil, fmt.Errorf("TOTP验证失败")
 	}
 
+	// 使用更严格的TOTP验证
+	if !verifyTOTPStrict(totpSecret, totpCode) {
+		return nil, fmt.Errorf("TOTP验证失败 - 请使用当前时间窗口的验证码")
+	}
+
 	// 使用TOTP密钥解密私钥
 	salt, err := base64.StdEncoding.DecodeString(wm.wallet.Salt)
 	if err != nil {
@@ -277,6 +284,38 @@ func (wm *WalletManager) decryptPrivateKeyWithTOTP(totpCode string) (*solana.Pri
 	}
 
 	return privateKey, nil
+}
+
+// 自定义TOTP验证 - 只验证当前时间窗口
+func verifyTOTPStrict(secret, code string) bool {
+	fmt.Printf("严格验证TOTP - 密钥: %s, 验证码: %s\n", secret, code)
+
+	// 获取当前时间戳
+	now := time.Now().Unix()
+
+	// 计算当前时间窗口
+	currentWindow := now / 30
+
+	// 生成当前时间窗口的验证码
+	currentCode, err := totp.GenerateCodeCustom(secret, time.Unix(currentWindow*30, 0), totp.ValidateOpts{
+		Period:    30,
+		Skew:      0,
+		Digits:    6,
+		Algorithm: otp.AlgorithmSHA1,
+	})
+	if err != nil {
+		fmt.Printf("生成TOTP验证码失败: %v\n", err)
+		return false
+	}
+
+	fmt.Printf("当前时间窗口: %d\n", currentWindow)
+	fmt.Printf("期望的验证码: %s\n", currentCode)
+	fmt.Printf("输入的验证码: %s\n", code)
+
+	isValid := code == currentCode
+	fmt.Printf("严格TOTP验证结果: %v\n", isValid)
+
+	return isValid
 }
 
 // 安全输入密码
