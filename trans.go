@@ -468,54 +468,40 @@ func loadWallet() (*WalletManager, error) {
 	}, nil
 }
 
-// 安全转账 - 双重验证
-func (wm *WalletManager) secureTransfer(toAddress string, amount uint64) error {
-	// 第一步：获取并验证密码
-	password, err := getPassword("请输入钱包密码: ")
-	if err != nil {
-		return err
-	}
-
-	// 验证密码（不返回私钥）
-	err = wm.verifyPassword(password)
-	if err != nil {
-		return fmt.Errorf("密码错误: %v", err)
-	}
-
-	fmt.Println("✓ 密码验证成功")
-
-	// 第二步：获取TOTP验证码
-	totpCode, err := getPassword("请输入Google Authenticator验证码: ")
-	if err != nil {
-		return err
-	}
-
-	// 使用TOTP验证码解密私钥
-	privateKey, err := wm.decryptPrivateKeyWithTOTP(totpCode)
-	if err != nil {
-		return fmt.Errorf("TOTP验证失败: %v", err)
-	}
-
-	fmt.Println("✓ TOTP验证成功")
-
-	// 执行转账
-	txHash, err := wm.transferSOL(privateKey, toAddress, amount)
-	if err != nil {
-		return fmt.Errorf("转账失败: %v", err)
-	}
-
-	fmt.Printf("✓ 转账成功! 交易哈希: %s\n", txHash)
-	return nil
-}
-
 // 转账SOL
 func (wm *WalletManager) transferSOL(fromPrivateKey *solana.PrivateKey, toAddress string, amount uint64) (string, error) {
 	toPubKey, err := solana.PublicKeyFromBase58(toAddress)
 	if err != nil {
-		return "", fmt.Errorf("无效的接收地址: %v", err)
+		return "", fmt.Errorf("接收地址格式错误: %v", err)
 	}
 
 	fromPubKey := fromPrivateKey.PublicKey()
+
+	// 检查账户余额
+	balance, err := wm.client.GetBalance(context.Background(), fromPubKey, rpc.CommitmentFinalized)
+	if err != nil {
+		return "", fmt.Errorf("获取账户余额失败: %v", err)
+	}
+
+	fmt.Printf("当前账户余额: %d lamports (%.9f SOL)\n", balance.Value, float64(balance.Value)/1e9)
+
+	// 检查余额是否足够（包括手续费）
+	estimatedFee := uint64(5000) // 估计手续费 5000 lamports
+	totalRequired := amount + estimatedFee
+
+	if balance.Value < totalRequired {
+		return "", fmt.Errorf("余额不足!\n"+
+			"  当前余额: %.9f SOL (%d lamports)\n"+
+			"  转账金额: %.9f SOL (%d lamports)\n"+
+			"  预估手续费: %.9f SOL (%d lamports)\n"+
+			"  总共需要: %.9f SOL (%d lamports)\n"+
+			"  缺少: %.9f SOL (%d lamports)",
+			float64(balance.Value)/1e9, balance.Value,
+			float64(amount)/1e9, amount,
+			float64(estimatedFee)/1e9, estimatedFee,
+			float64(totalRequired)/1e9, totalRequired,
+			float64(totalRequired-balance.Value)/1e9, totalRequired-balance.Value)
+	}
 
 	instruction := system.NewTransferInstruction(
 		amount,
@@ -525,7 +511,7 @@ func (wm *WalletManager) transferSOL(fromPrivateKey *solana.PrivateKey, toAddres
 
 	recent, err := wm.client.GetLatestBlockhash(context.Background(), rpc.CommitmentFinalized)
 	if err != nil {
-		return "", fmt.Errorf("获取区块哈希失败: %v", err)
+		return "", fmt.Errorf("获取最新区块哈希失败: %v", err)
 	}
 
 	tx, err := solana.NewTransaction(
@@ -546,19 +532,153 @@ func (wm *WalletManager) transferSOL(fromPrivateKey *solana.PrivateKey, toAddres
 		},
 	)
 	if err != nil {
-		return "", fmt.Errorf("签名交易失败: %v", err)
+		return "", fmt.Errorf("交易签名失败: %v", err)
 	}
 
 	sig, err := wm.client.SendTransaction(context.Background(), tx)
 	if err != nil {
-		return "", fmt.Errorf("发送交易失败: %v", err)
+		return "", parseTransactionError(err)
 	}
 
 	return sig.String(), nil
 }
 
+// 解析交易错误，返回用户友好的错误信息
+func parseTransactionError(err error) error {
+	errStr := err.Error()
+
+	// 检查常见错误类型
+	if strings.Contains(errStr, "AccountNotFound") {
+		return fmt.Errorf("账户错误:\n" +
+			"  • 发送方账户不存在或未激活\n" +
+			"  • 账户可能没有足够的SOL来支付交易费用\n" +
+			"  • 建议: 请先向此账户转入一些SOL来激活账户")
+	}
+
+	if strings.Contains(errStr, "InsufficientFundsForFee") {
+		return fmt.Errorf("手续费不足:\n" +
+			"  • 账户余额不足以支付交易手续费\n" +
+			"  • 建议: 请向账户转入更多SOL")
+	}
+
+	if strings.Contains(errStr, "InsufficientFundsForRent") {
+		return fmt.Errorf("租金不足:\n" +
+			"  • 账户余额不足以支付租金豁免\n" +
+			"  • 建议: 请向账户转入更多SOL")
+	}
+
+	if strings.Contains(errStr, "InvalidAccountData") {
+		return fmt.Errorf("账户数据无效:\n" +
+			"  • 账户数据格式错误\n" +
+			"  • 可能是账户类型不匹配")
+	}
+
+	if strings.Contains(errStr, "InvalidInstruction") {
+		return fmt.Errorf("交易指令无效:\n" +
+			"  • 交易指令格式错误\n" +
+			"  • 可能是参数不正确")
+	}
+
+	if strings.Contains(errStr, "InvalidSignature") {
+		return fmt.Errorf("签名无效:\n" +
+			"  • 交易签名验证失败\n" +
+			"  • 可能是私钥不正确")
+	}
+
+	if strings.Contains(errStr, "BlockhashNotFound") {
+		return fmt.Errorf("区块哈希过期:\n" +
+			"  • 使用的区块哈希已过期\n" +
+			"  • 建议: 重试交易")
+	}
+
+	if strings.Contains(errStr, "AlreadyProcessed") {
+		return fmt.Errorf("交易已处理:\n" +
+			"  • 此交易已经被处理过了\n" +
+			"  • 可能是重复提交")
+	}
+
+	if strings.Contains(errStr, "TooManyRequests") {
+		return fmt.Errorf("请求过于频繁:\n" +
+			"  • RPC节点请求限制\n" +
+			"  • 建议: 稍后重试")
+	}
+
+	if strings.Contains(errStr, "NodeUnhealthy") {
+		return fmt.Errorf("节点不健康:\n" +
+			"  • RPC节点状态异常\n" +
+			"  • 建议: 稍后重试或更换RPC节点")
+	}
+
+	// 如果是网络相关错误
+	if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "connection") {
+		return fmt.Errorf("网络连接错误:\n" +
+			"  • 网络连接超时或中断\n" +
+			"  • 建议: 检查网络连接后重试")
+	}
+
+	// 提取关键错误信息
+	if strings.Contains(errStr, "Transaction simulation failed") {
+		if strings.Contains(errStr, "Attempt to debit an account but found no record of a prior credit") {
+			return fmt.Errorf("转账失败 - 账户余额不足:\n" +
+				"  • 发送方账户没有足够的SOL余额\n" +
+				"  • 账户可能从未接收过SOL转账\n" +
+				"  • 建议: 请先向发送方账户转入SOL\n" +
+				"  • 最少需要: 0.001 SOL 来激活账户")
+		}
+	}
+
+	// 如果无法识别具体错误，返回原始错误但格式化
+	return fmt.Errorf("交易发送失败:\n"+
+		"  • 详细错误: %s\n"+
+		"  • 建议: 请检查网络连接、账户余额和交易参数后重试", errStr)
+}
+
+// 安全转账 - 添加更好的错误处理
+func (wm *WalletManager) secureTransfer(toAddress string, amount uint64) error {
+	// 第一步：获取并验证密码
+	password, err := getPassword("请输入钱包密码: ")
+	if err != nil {
+		return fmt.Errorf("密码输入失败: %v", err)
+	}
+
+	// 验证密码（不返回私钥）
+	err = wm.verifyPassword(password)
+	if err != nil {
+		return fmt.Errorf("❌ 密码验证失败: %v", err)
+	}
+
+	fmt.Println("✓ 密码验证成功")
+
+	// 第二步：获取TOTP验证码
+	totpCode, err := getPassword("请输入Google Authenticator验证码: ")
+	if err != nil {
+		return fmt.Errorf("验证码输入失败: %v", err)
+	}
+
+	// 使用TOTP验证码解密私钥
+	privateKey, err := wm.decryptPrivateKeyWithTOTP(totpCode)
+	if err != nil {
+		return fmt.Errorf("❌ Google验证码验证失败: %v", err)
+	}
+
+	fmt.Println("✓ Google验证码验证成功")
+	fmt.Println("正在检查账户余额...")
+
+	// 执行转账
+	txHash, err := wm.transferSOL(privateKey, toAddress, amount)
+	if err != nil {
+		return fmt.Errorf("❌ %v", err)
+	}
+
+	fmt.Printf("✅ 转账成功!\n")
+	fmt.Printf("💰 转账金额: %.9f SOL\n", float64(amount)/1e9)
+	fmt.Printf("📝 交易哈希: %s\n", txHash)
+	fmt.Printf("🔗 区块链浏览器: https://explorer.solana.com/tx/%s?cluster=devnet\n", txHash)
+	return nil
+}
+
 // 自定加密交易的方式
-func transfer() {
+func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("=== Solana 安全钱包 ===")
 		fmt.Println("使用方法:")
